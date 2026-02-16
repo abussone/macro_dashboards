@@ -1,0 +1,17 @@
+# Streamlit/local secrets
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local virtual environment
+.venv/
+.env
+
+# Local caches and generated data
+.cache_yf_mm/
+cache_gold/
+
+# macOS
+.DS_Store
