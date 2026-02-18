@@ -15,6 +15,7 @@ from urllib.parse import urljoin
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 from requests.adapters import HTTPAdapter
@@ -53,6 +54,12 @@ INFLATION_SERIES = {
     30: "T30YIEM",
 }
 
+# --- CPI inflation inputs (new 'Inflation' page) ---
+CPI_HEADLINE_SERIES_ID = "CPIAUCNS"   # CPI-U: All items
+CPI_CORE_SERIES_ID = "CPILFESL"      # CPI-U: All items less food & energy
+CPI_HARD_CUTOFF = "1990-01-01"
+CPI_PLOT_START_DEFAULT = "2005-01-01"
+
 # --- Yield curve inputs ---
 YIELD_CURVE_SERIES = {
     "DGS1MO": "1M",
@@ -85,6 +92,16 @@ MM_SERIES_NAMES = [
     "Broad General Collateral (BGCR)",
     "Tri-Party General Collateral (TGCR)",
 ]
+
+
+# --- Financial conditions & liquidity inputs (FRED) ---
+FINCOND_START_DATE = "2020-01-01"
+FINCOND_SMOOTH_DAYS = 5
+
+FINCOND_WALCL_SERIES_ID = "WALCL"      # Fed total assets (Millions USD, weekly)
+FINCOND_RRP_SERIES_ID   = "RRPONTSYD"  # ON RRP (Billions USD, daily)
+FINCOND_TGA_SERIES_ID   = "WDTGAL"     # Treasury General Account (Millions USD, weekly)
+FINCOND_NFCI_SERIES_ID  = "NFCI"       # Chicago Fed NFCI (weekly)
 
 # --- Hedge fund inputs (CFTC COT) ---
 CFTC_USER_AGENT = {"User-Agent": "Mozilla/5.0"}
@@ -187,12 +204,9 @@ def _resample_month_end(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _fig_from_spec(data: list[dict], layout: dict, height: int) -> go.Figure:
-    """Build Plotly figure from dict specs (keeps original trace/layout logic).
-
-    Keeps horizontal legends with negative y *inside* the canvas to avoid Streamlit scrollbars.
-    """
-    fig = go.Figure(data=data, layout=layout)
+def _apply_dashboard_style(fig: go.Figure, *, height: int, layout: dict | None = None) -> go.Figure:
+    """Apply the dashboard's unified Plotly styling to an existing figure."""
+    layout = layout or {}
 
     # ---- Defensive Plotly hygiene ----
     # Plotly/Streamlit + unified hover can show a bold "undefined" when:
@@ -227,6 +241,7 @@ def _fig_from_spec(data: list[dict], layout: dict, height: int) -> go.Figure:
         height=height,
         margin=base_margin,
     )
+
     # Force black font for all elements using safest update methods
     fig.update_layout(
         font=dict(color="black"),
@@ -235,7 +250,6 @@ def _fig_from_spec(data: list[dict], layout: dict, height: int) -> go.Figure:
     )
 
     # Avoid Plotly rendering a bold "undefined" title when only title styling is applied.
-    # This can happen if a figure has no explicit title text but we set title font/color.
     try:
         t_text = None
         if getattr(fig.layout, "title", None) is not None:
@@ -247,9 +261,21 @@ def _fig_from_spec(data: list[dict], layout: dict, height: int) -> go.Figure:
         fig.update_layout(title=dict(font=dict(color="black")))
     except Exception:
         pass
-    fig.update_xaxes(tickfont=dict(color="black"), title_font=dict(color="black"), linecolor="black", gridcolor="rgba(0,0,0,0.05)")
-    fig.update_yaxes(tickfont=dict(color="black"), title_font=dict(color="black"), linecolor="black", gridcolor="rgba(0,0,0,0.05)")
 
+    fig.update_xaxes(
+        tickfont=dict(color="black"),
+        title_font=dict(color="black"),
+        linecolor="black",
+        gridcolor="rgba(0,0,0,0.05)",
+    )
+    fig.update_yaxes(
+        tickfont=dict(color="black"),
+        title_font=dict(color="black"),
+        linecolor="black",
+        gridcolor="rgba(0,0,0,0.05)",
+    )
+
+    # Keep horizontal legends with negative y *inside* the canvas to avoid Streamlit scrollbars.
     try:
         leg = fig.layout.legend
         if leg and getattr(leg, "orientation", None) == "h":
@@ -265,13 +291,20 @@ def _fig_from_spec(data: list[dict], layout: dict, height: int) -> go.Figure:
                 rows = max(1, int(math.ceil(n_items / per_row)))
                 legend_px = 26 * rows + 28
                 needed_b = max(int(base_margin.get("b", 0) or 0), 70 + legend_px)
-                fig.update_layout(margin=dict(**base_margin, b=needed_b), height=height + max(0, needed_b - base_margin.get("b", 0)))
+                fig.update_layout(
+                    margin=dict(**base_margin, b=needed_b),
+                    height=height + max(0, needed_b - base_margin.get("b", 0)),
+                )
     except Exception:
         pass
 
     return fig
 
 
+def _fig_from_spec(data: list[dict], layout: dict, height: int) -> go.Figure:
+    """Build Plotly figure from dict specs (keeps original trace/layout logic)."""
+    fig = go.Figure(data=data, layout=layout)
+    return _apply_dashboard_style(fig, height=height, layout=layout)
 def _inject_light_ui():
     """Subtle, professional, mostly-white UI polish (same approach as app_eu_dashboard)."""
     st.markdown(
@@ -942,6 +975,243 @@ def build_fomc_figs():
     return (fig1, obs1, src1, latest_date.strftime("%Y-%m-%d")), (fig2, obs2, src2)
 
 
+
+# =============================================================================
+# SECTION 1B — CPI INFLATION (NEW)
+# =============================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def build_cpi_inflation_figs(
+    plot_start: str = CPI_PLOT_START_DEFAULT,
+    hard_cutoff: str = CPI_HARD_CUTOFF,
+) -> dict:
+    """Build US CPI inflation dashboard figures (Headline vs Core).
+
+    Uses FRED CPI indices:
+      - CPIAUCNS (Headline CPI-U)
+      - CPILFESL (Core CPI-U)
+    """
+    headline = pd.to_numeric(fred_series(CPI_HEADLINE_SERIES_ID, hard_cutoff), errors="coerce").dropna()
+    core = pd.to_numeric(fred_series(CPI_CORE_SERIES_ID, hard_cutoff), errors="coerce").dropna()
+
+    src = [
+        f"FRED: {CPI_HEADLINE_SERIES_ID} (CPI-U headline), {CPI_CORE_SERIES_ID} (CPI-U core)",
+    ]
+
+    if headline.empty or core.empty:
+        obs = ["CPI series unavailable (FRED fetch returned no usable observations)."]
+        return {"yoy": (None, obs, src), "mom": (None, obs, src), "level_mom": (None, obs, src), "asof": "n/a"}
+
+    df = pd.concat([headline.rename("Headline"), core.rename("Core")], axis=1).dropna()
+    df = df.loc[pd.to_datetime(hard_cutoff) :].copy()
+    if df.empty or len(df) < 24:
+        obs = ["CPI history too short after cutoff to compute YoY/MoM changes."]
+        return {"yoy": (None, obs, src), "mom": (None, obs, src), "level_mom": (None, obs, src), "asof": "n/a"}
+
+    # Metrics
+    df["Headline YoY"] = df["Headline"].pct_change(12) * 100.0
+    df["Core YoY"] = df["Core"].pct_change(12) * 100.0
+    df["Headline MoM"] = df["Headline"].pct_change(1) * 100.0
+    df["Core MoM"] = df["Core"].pct_change(1) * 100.0
+    df["Core 3M Annualized"] = ((df["Core"] / df["Core"].shift(3)) ** 4 - 1) * 100.0
+
+    plot_start_ts = pd.to_datetime(plot_start)
+    dfp = df.loc[plot_start_ts:].copy()
+
+    # --- Figure 1: YoY ---
+    yoy = dfp[["Headline YoY", "Core YoY"]].dropna()
+    fig_yoy = None
+    obs_yoy: list[str] = []
+    if not yoy.empty:
+        x0, x1 = yoy.index.min(), yoy.index.max()
+        shapes = [
+            # 1–3% band
+            {
+                "type": "rect",
+                "xref": "x",
+                "yref": "y",
+                "x0": x0,
+                "x1": x1,
+                "y0": 1,
+                "y1": 3,
+                "fillcolor": "rgba(220,53,69,0.10)",
+                "line": {"width": 0},
+                "layer": "below",
+            },
+            # 2% target line
+            {
+                "type": "line",
+                "xref": "x",
+                "yref": "y",
+                "x0": x0,
+                "x1": x1,
+                "y0": 2,
+                "y1": 2,
+                "line": {"color": "rgba(220,53,69,0.90)", "width": 1.6, "dash": "dash"},
+            },
+        ]
+        data_yoy = [
+            {
+                "type": "scatter",
+                "mode": "lines",
+                "name": "Headline CPI (YoY)",
+                "x": yoy.index,
+                "y": yoy["Headline YoY"].values.astype(float),
+                "line": {"width": 2.2, "color": "black"},
+            },
+            {
+                "type": "scatter",
+                "mode": "lines",
+                "name": "Core CPI (YoY)",
+                "x": yoy.index,
+                "y": yoy["Core YoY"].values.astype(float),
+                "line": {"width": 2.2, "color": "#0B3D91"},
+            },
+        ]
+        layout_yoy = {
+            "xaxis": {"title": "", "tickformat": "%Y", "dtick": "M24"},
+            "yaxis": {"title": "YoY Change %", "zeroline": True, "zerolinecolor": "black", "zerolinewidth": 1},
+            "shapes": shapes,
+            "legend": {"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.25},
+            "margin": {"l": 60, "r": 40, "t": 30, "b": 90},
+        }
+        fig_yoy = _fig_from_spec(data_yoy, layout_yoy, height=520)
+
+        last_dt = yoy.index.max()
+        obs_yoy = [
+            f"Latest ({last_dt.strftime('%Y-%m')}): Headline {yoy.loc[last_dt, 'Headline YoY']:.2f}%, Core {yoy.loc[last_dt, 'Core YoY']:.2f}%",
+            "Shaded band = 1–3% range; dashed red line = 2%",
+        ]
+    else:
+        obs_yoy = ["YoY inflation series unavailable after selected start date."]
+
+    # --- Figure 2: MoM (stacked panels) ---
+    mom = dfp[["Headline MoM", "Core MoM"]].dropna()
+    fig_mom = None
+    obs_mom: list[str] = []
+    if not mom.empty:
+        fig_mom = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.08,
+            subplot_titles=("Headline CPI (MoM %)", "Core CPI (MoM %)"),
+        )
+        fig_mom.add_trace(
+            go.Bar(
+                x=mom.index,
+                y=mom["Headline MoM"].values.astype(float),
+                name="Headline MoM",
+                marker_color="black",
+                opacity=1.0,
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+        fig_mom.add_trace(
+            go.Bar(
+                x=mom.index,
+                y=mom["Core MoM"].values.astype(float),
+                name="Core MoM",
+                marker_color="#0B3D91",
+                opacity=1.0,
+                showlegend=False,
+            ),
+            row=2,
+            col=1,
+        )
+        fig_mom.update_yaxes(title_text="MoM %", zeroline=True, zerolinecolor="black", zerolinewidth=1, row=1, col=1)
+        fig_mom.update_yaxes(title_text="MoM %", zeroline=True, zerolinecolor="black", zerolinewidth=1, row=2, col=1)
+        fig_mom.update_xaxes(tickformat="%Y", dtick="M24", row=2, col=1)
+
+        # Ensure subplot titles are black to match the app theme
+        try:
+            fig_mom.update_annotations(font=dict(color="black"))
+        except Exception:
+            pass
+
+        fig_mom.update_layout(
+            legend={"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.22},
+            margin={"l": 60, "r": 40, "t": 45, "b": 95},
+        )
+        fig_mom = _apply_dashboard_style(fig_mom, height=650, layout={"margin": {"l": 60, "r": 40, "t": 45, "b": 95}, "hovermode": "x unified"})
+
+        last_dt = mom.index.max()
+        obs_mom = [
+            f"Latest ({last_dt.strftime('%Y-%m')}): Headline {mom.loc[last_dt, 'Headline MoM']:.2f}%, Core {mom.loc[last_dt, 'Core MoM']:.2f}%",
+            "Monthly bars highlight short-term inflation impulse.",
+        ]
+    else:
+        obs_mom = ["MoM inflation series unavailable after selected start date."]
+
+    # --- Figure 3: Core price level (index) + 3M annualized momentum ---
+    lvl = dfp[["Core", "Core 3M Annualized"]].dropna()
+    fig_lvl = None
+    obs_lvl: list[str] = []
+    if not lvl.empty:
+        core_idx = (lvl["Core"] / float(lvl["Core"].iloc[0])) * 100.0
+        data_lvl = [
+            {
+                "type": "scatter",
+                "mode": "lines",
+                "name": "Core Index",
+                "x": lvl.index,
+                "y": core_idx.values.astype(float),
+                "line": {"width": 2.2, "color": "black"},
+            },
+            {
+                "type": "scatter",
+                "mode": "lines",
+                "name": "Core Momentum (3M-annualized)",
+                "x": lvl.index,
+                "y": lvl["Core 3M Annualized"].values.astype(float),
+                "yaxis": "y2",
+                "line": {"width": 1.4, "color": "#9E9E9E"},
+                "opacity": 0.55,
+            },
+        ]
+        x0, x1 = lvl.index.min(), lvl.index.max()
+        shapes = [
+            {
+                "type": "line",
+                "xref": "x",
+                "yref": "y2",
+                "x0": x0,
+                "x1": x1,
+                "y0": 0,
+                "y1": 0,
+                "line": {"color": "black", "width": 1, "dash": "solid"},
+            }
+        ]
+        layout_lvl = {
+            "xaxis": {"title": "", "tickformat": "%Y", "dtick": "M24"},
+            "yaxis": {"title": "Index", "showgrid": True},
+            "yaxis2": {"title": "3M annualized (%)", "overlaying": "y", "side": "right", "showgrid": False},
+            "shapes": shapes,
+            "legend": {"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.25},
+            "margin": {"l": 60, "r": 60, "t": 30, "b": 95},
+        }
+        fig_lvl = _fig_from_spec(data_lvl, layout_lvl, height=560)
+
+        last_dt = lvl.index.max()
+        obs_lvl = [
+            f"Latest ({last_dt.strftime('%Y-%m')}): Core index {core_idx.loc[last_dt]:.1f}, 3M annualized {lvl.loc[last_dt, 'Core 3M Annualized']:.2f}%",
+        ]
+    else:
+        obs_lvl = ["Core level/momentum series unavailable after selected start date."]
+
+    asof = "n/a"
+    for s in [yoy, mom, lvl]:
+        if isinstance(s, pd.DataFrame) and not s.empty:
+            asof = max(asof, s.index.max().strftime("%Y-%m-%d")) if asof != "n/a" else s.index.max().strftime("%Y-%m-%d")
+
+    return {
+        "yoy": (fig_yoy, obs_yoy, src),
+        "mom": (fig_mom, obs_mom, src),
+        "level_mom": (fig_lvl, obs_lvl, src),
+        "asof": asof,
+    }
+
 # =============================================================================
 # SECTION 2 — YIELD CURVE
 # =============================================================================
@@ -1230,13 +1500,13 @@ def build_money_market_figs():
     dfs, dfs_funds, names = mm_fetch_all_data()
 
     obs_specs_plot1 = [
-        "DPCREDIT: Discount Window Primary Credit Rate",
-        "IORB - UNSEC: Interest Rate on Reserve Balances",
-        "DFF - UNSEC: Federal Funds Effective Rate",
-        "OBFR - UNSEC: Overnight Bank Funding Rate",
-        "SOFR - SEC: Secured Overnight Financing Rate",
-        "RRPONTSYAWARD: Overnight Reverse Repurchase Agreements Award Rate (Treasury collateral)",
-        "RRPONTTLD: Overnight Reverse Repurchase Agreements total volume (Treasury collateral)",
+        "DPCREDIT - SEC: [Discount Window Primary Credit Rate] Interest Rate Banks pay to borrow overnight from FED (secured by collateral) - Effective ceiling of the policy corridor.",
+        "IORB - UNSEC: [Interest Rate on Reserve Balances] Interes Rate Banks receive on overnight deposits (reserves) held with the FED - Administrative tool to steer DFF.",
+        "DFF - UNSEC: [Federal Funds Effective Rate] Volume-weighted merdian of overnight transaction data for Banks lending reserves to other Banks - Explicit policy target of the FOMC.",
+        "OBFR - UNSEC: [Overnight Bank Funding Rate] Unsec overnight Bank funding cost (DFF + Eurodollar transactions) - Benchmak for global unsec dollar funding.",
+        "SOFR - SEC: [Secured Overnight Financing Rate (Treasury collateral)] Measure of the cost of borrowing cash overnight - Primary risk-free benchmark.",
+        "RRPONTSYAWARD - SEC: [Overnight Reverse Repurchase Agreements Award Rate (Treasury collateral)] Interest Rate the FED pays on cash accepted from counterparties - Absolute floor for short-term Money Market Rates.",
+        "RRPONTTLD: [Overnight Reverse Repurchase Agreements total volume (Treasury collateral)] Volume of cash place at the FED by non-bank counterparties - Indicator of excess liquidity in the non-banking sector.",
     ]
 
     prev_year = datetime.datetime.now().year - 1
@@ -1278,6 +1548,129 @@ def build_money_market_figs():
         "titles": {"c": title_c, "d": title_d, "e": title_e},
         "raw": (dfs, dfs_funds, names),
     }
+
+
+
+# =============================================================================
+# SECTION 3B — FINANCIAL CONDITIONS & LIQUIDITY (FRED)
+# =============================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def fincond_get_us_liquidity_dashboard(
+    start: str = FINCOND_START_DATE,
+    smooth_days: int = FINCOND_SMOOTH_DAYS,
+) -> pd.DataFrame:
+    """US liquidity & financial conditions dashboard (daily grid).
+
+    Net Liquidity (USD bn) = WALCL - RRP - TGA
+      - WALCL, TGA are in millions -> converted to billions
+      - RRP already in billions
+    Stress proxy = Chicago Fed NFCI
+
+    Both series are smoothed with a calendar-day rolling mean (default: 5D),
+    after forward-filling to a daily grid so matplotlib/plotly lines don't break.
+    """
+    start = str(start)
+
+    walcl = fred_series(FINCOND_WALCL_SERIES_ID, start)  # Millions
+    rrp   = fred_series(FINCOND_RRP_SERIES_ID,   start)  # Billions
+    tga   = fred_series(FINCOND_TGA_SERIES_ID,   start)  # Millions
+    nfci  = fred_series(FINCOND_NFCI_SERIES_ID,  start)  # Index (weekly)
+
+    df = pd.concat([walcl, rrp, tga, nfci], axis=1, keys=["WALCL", "RRP", "TGA", "NFCI"]).sort_index()
+    if df.empty:
+        return pd.DataFrame()
+
+    # Daily grid (connect points)
+    df = df.resample("D").ffill().bfill()
+
+    # If RRP has sporadic missing, treat as 0 (rare)
+    df["RRP"] = df["RRP"].fillna(0.0)
+
+    # Unit normalization to Billions
+    df["WALCL_b"] = df["WALCL"] / 1000.0
+    df["TGA_b"]   = df["TGA"]   / 1000.0
+    df["RRP_b"]   = df["RRP"]
+
+    # Net Liquidity (Billions)
+    df["NetLiq_b"] = df["WALCL_b"] - df["RRP_b"] - df["TGA_b"]
+
+    # Smoothing: rolling mean (calendar days, after daily fill)
+    if smooth_days and smooth_days > 1:
+        df["NFCI_s"]   = df["NFCI"].rolling(smooth_days, min_periods=1).mean()
+        df["NetLiq_s"] = df["NetLiq_b"].rolling(smooth_days, min_periods=1).mean()
+    else:
+        df["NFCI_s"] = df["NFCI"]
+        df["NetLiq_s"] = df["NetLiq_b"]
+
+    # Remove any remaining breaks
+    df[["NFCI_s", "NetLiq_s"]] = (
+        df[["NFCI_s", "NetLiq_s"]]
+        .interpolate(method="time")
+        .ffill()
+        .bfill()
+    )
+
+    return df[df.index >= pd.to_datetime(start)].copy()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def build_fincond_liquidity_fig(
+    start: str = FINCOND_START_DATE,
+    smooth_days: int = FINCOND_SMOOTH_DAYS,
+):
+    """Twin-axis chart: NFCI (left) vs Net Liquidity (right)."""
+    df = fincond_get_us_liquidity_dashboard(start=start, smooth_days=smooth_days)
+
+    src = [
+        "FRED: WALCL (Fed total assets), RRPONTSYD (ON RRP), WDTGAL (TGA), NFCI (Chicago Fed).",
+    ]
+
+    if df is None or df.empty or df[["NFCI_s", "NetLiq_s"]].dropna(how="all").empty:
+        return None, ["US liquidity/financial conditions data unavailable (FRED fetch returned empty)."], src
+
+    last_dt = pd.to_datetime(df.index[-1])
+    nfci_last = float(df["NFCI_s"].iloc[-1])
+    netliq_last = float(df["NetLiq_s"].iloc[-1])
+
+    obs = [
+        "NFCI: [National Financial Conditions Index] Financial stress across money markets, debt, equity, and banking indicators. Positive values - fin.cond. are tighter than the historical avg, negative values signal looser conditions.",
+        "Net liquidity proxy = WALCL − RRP − TGA (converted to USD billions).",
+        "WALCL: [FED Total Assets] Total FED Balance sheet size (liquidity source).",
+        "RRP: [Reverse Repurchase Agreements] Cash at the FED by Money Market Funds (liquidity drain).",
+        "TGA: [Treasury General Account] US Govt checking account, as it fills drain cash out the banking system (liquidity drain).",
+        f"Both series are {smooth_days}-day rolling averages.",
+    ]
+
+    data = [
+        {
+            "type": "scatter",
+            "mode": "lines",
+            "name": "NFCI",
+            "x": df.index,
+            "y": df["NFCI_s"].values.astype(float),
+            "line": {"width": 2.6, "color": "#0B3D91", "dash": "solid"},
+        },
+        {
+            "type": "scatter",
+            "mode": "lines",
+            "name": "Net Liquidity",
+            "x": df.index,
+            "y": df["NetLiq_s"].values.astype(float),
+            "yaxis": "y2",
+            "line": {"width": 2.6, "color": "black", "dash": "solid"},
+        },
+    ]
+
+    layout = {
+        "xaxis": {"title": "", "tickformat": "%Y", "dtick": "M12"},
+        "yaxis": {"title": "NFCI (index)"},
+        "yaxis2": {"title": "Net Liquidity (USD bn)", "overlaying": "y", "side": "right", "showgrid": False},
+        "legend": {"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.25},
+        "margin": {"l": 60, "r": 80, "t": 45, "b": 95},
+    }
+
+    fig = _fig_from_spec(data, layout, height=520)
+    return fig, obs, src
 
 
 # =============================================================================
@@ -1881,6 +2274,18 @@ def load_dashboard_data() -> dict:
         (fomc1, obs1, src1, asof) = (None, _err(msg), ["FRED / Atlanta Fed / Fed SEP"], "n/a")
         (fomc2, obs2, src2) = (None, _err(msg), ["FRED"],)
 
+    # ===== INFLATION (CPI) =====
+    try:
+        infl = build_cpi_inflation_figs()
+    except Exception as e:
+        msg = f"Inflation section failed: {e}"
+        infl = {
+            "yoy": (None, _err(msg), ["FRED"]),
+            "mom": (None, _err(msg), ["FRED"]),
+            "level_mom": (None, _err(msg), ["FRED"]),
+            "asof": "n/a",
+        }
+
     # ===== YIELD CURVE =====
     try:
         yc1, yc2, yc_asof = build_yield_curve_figs()
@@ -1904,6 +2309,14 @@ def load_dashboard_data() -> dict:
             "titles": {"c": "Private repo demand", "d": "Bank repos", "e": "Reserve demand"},
         }
 
+
+    # ===== FINANCIAL CONDITIONS & LIQUIDITY =====
+    try:
+        fincond_fig, fincond_obs, fincond_src = build_fincond_liquidity_fig()
+    except Exception as e:
+        msg = f"Financial conditions section failed: {e}"
+        fincond_fig, fincond_obs, fincond_src = None, _err(msg), ["FRED"]
+
     # ===== HEDGE FUNDS =====
     try:
         hf = build_hedge_fund_figs()
@@ -1920,8 +2333,10 @@ def load_dashboard_data() -> dict:
     return {
         "kpis": kpis,
         "fomc": {"policy": (fomc1, obs1, src1, asof), "breakevens": (fomc2, obs2, src2)},
+        "inflation": infl,
         "yield_curve": {"snapshots": yc1, "timeseries": yc2, "asof": yc_asof},
         "money_market": mm,
+        "fincond": (fincond_fig, fincond_obs, fincond_src),
         "hedge_funds": hf,
         "gold": (gold_top, gold_bot, gold_obs, gold_src),
     }
@@ -1963,7 +2378,7 @@ def main():
 
     page = st.radio(
         "Navigation",
-        ["Monetary Policy", "Yield Curve", "Money Market", "Hedge Funds", "Gold & Liquidity"],
+        ["Monetary Policy", "Inflation", "Yield Curve", "Money Market", "Financial Conditions & Liquidity", "Hedge Funds", "Gold & Liquidity"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -1981,6 +2396,24 @@ def main():
         _show_chart("Breakeven Market-implied Breakeven Inflation Expectations", fig2, obs2, src2)
 
     # ===== YIELD CURVE =====
+
+    # ===== INFLATION =====
+    elif page == "Inflation":
+        infl = data.get("inflation")
+        if not infl:
+            st.warning("Inflation section unavailable.")
+        else:
+            fig, obs, src = infl.get("yoy", (None, None, None))
+            _show_chart("Headline vs Core Inflation", fig, obs, src)
+
+            st.markdown("---")
+            fig, obs, src = infl.get("mom", (None, None, None))
+            _show_chart("Inflation Impulse - MoM %", fig, obs, src)
+
+            st.markdown("---")
+            fig, obs, src = infl.get("level_mom", (None, None, None))
+            _show_chart("Core Inflation Index & 3M Momentum", fig, obs, src)
+
     elif page == "Yield Curve":
         fig1, obs1, src1 = data["yield_curve"]["snapshots"]
         _show_chart("US Treasury Yield Curve (Monthly Snapshots, last 24 months)", fig1, obs1, src1)
@@ -2008,6 +2441,11 @@ def main():
 
         st.markdown("---")
         _show_chart(mm["titles"]["e"], *mm["plot_e"])
+
+    # ===== FINANCIAL CONDITIONS & LIQUIDITY =====
+    elif page == "Financial Conditions & Liquidity":
+        fig, obs, src = data.get("fincond", (None, None, None))
+        _show_chart("Financial Conditions vs Net Liquidity", fig, obs, src)
 
     # ===== HEDGE FUNDS =====
     elif page == "Hedge Funds":

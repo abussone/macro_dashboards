@@ -1,10 +1,13 @@
 import datetime
 import math
+import gzip
+import io
 from io import StringIO
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 from requests.adapters import HTTPAdapter
@@ -30,6 +33,25 @@ COLORS = {
 ECB_DATA_API = "https://data-api.ecb.europa.eu/service/data"
 START_DATE_GLOBAL = "2015-01-01"
 START_DATE_POLICY = "2020-01-01"
+
+# =============================================================================
+# FINANCIAL CONDITIONS & LIQUIDITY (ECB)
+# Stress proxy: CISS (ECB)
+# Net Liquidity proxy (Millions EUR) = Assets - GovDeposits - DebtCert - FixedTermDeposits
+# Smoothing: 5-day average for Net Liquidity proxy
+# Start: 2020-01-01
+# =============================================================================
+FINCOND_START_DATE = "2020-01-01"
+FINCOND_LIQ_SMOOTH_DAYS = 5
+
+# --- Series keys ---
+FINCOND_CISS_KEY = "D.U2.Z0Z.4F.EC.SS_CIN.IDX"              # CISS / daily
+FINCOND_ASSETS_KEY = "W.U2.C.T000000.Z5.Z01"               # Total assets/liabilities / weekly / mn EUR
+FINCOND_GOVDEP_EOP_KEY = "M.U2.C.L050100.U2.EUR"           # Central gov deposits (EOP) / monthly / mn EUR
+FINCOND_GOVDEP_MP_KEY  = "M.U2.C.L050100MP.U2.EUR"         # Central gov deposits (maint. period avg) / monthly / mn EUR
+FINCOND_DEBTCERT_KEY = "W.U2.C.L040000.Z5.EUR"             # Debt certificates issued / weekly / mn EUR
+FINCOND_FTD_KEY      = "M.U2.C.L020300.U2.EUR"             # Fixed-term deposits / monthly / mn EUR
+
 
 # =============================================================================
 # NETWORK SESSION
@@ -1155,6 +1177,502 @@ def _fetch_eurostat_net_flow(start_date: str) -> pd.Series:
         return pd.Series(dtype=float)
 
 
+
+# =============================================================================
+# EUROSTAT HICP (Headline/Core) (CACHED)
+# =============================================================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_eurostat_hicp_midx(timeout: int = 60*12) -> pd.DataFrame:
+    """Eurostat SDMX TSV (compressed): prc_hicp_midx -> EA20 headline & core index levels.
+
+    Returns a DataFrame indexed by month-end with columns:
+      - Headline (CP00)
+      - Core (TOT_X_NRG_FOOD)
+    Values are index levels (unit=I15).
+    """
+    url = "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/prc_hicp_midx?format=TSV&compressed=true"
+
+    try:
+        r = SESSION.get(url, timeout=timeout)
+        r.raise_for_status()
+        with gzip.open(io.BytesIO(r.content), "rt") as f:
+            df = pd.read_csv(f, sep="\t")
+    except Exception:
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # The first column contains the dimension headers (comma-separated), with TIME_PERIOD embedded.
+    first_col = df.columns[0]
+    headers = [h.strip() for h in str(first_col).split(",")]
+    if headers:
+        headers[-1] = headers[-1].replace(r"\\TIME_PERIOD", "").replace(r"\TIME_PERIOD", "").strip()
+
+    try:
+        df[headers] = df[first_col].astype(str).str.split(",", expand=True)
+    except Exception:
+        return pd.DataFrame()
+
+    df = df.drop(columns=[first_col])
+
+    for col in headers:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+
+    # Filter: EA20 + unit=I15 (index level) + headline/core codes
+    geo_col = "geo" if "geo" in df.columns else (headers[-1] if headers else "geo")
+    if geo_col in df.columns:
+        df = df[df[geo_col] == "EA20"]
+
+    if "unit" in df.columns:
+        df = df[df["unit"] == "I15"]
+
+    if "coicop" not in df.columns:
+        return pd.DataFrame()
+
+    target_codes = ["CP00", "TOT_X_NRG_FOOD"]
+    df = df[df["coicop"].isin(target_codes)]
+    if df.empty:
+        return pd.DataFrame()
+
+    # Pivot wide-by-date: melt monthly columns
+    id_vars = [c for c in headers if c in df.columns]
+    value_vars = [c for c in df.columns if c not in id_vars]
+
+    df_long = df.melt(id_vars=id_vars, value_vars=value_vars, var_name="period", value_name="value")
+
+    df_long["value"] = pd.to_numeric(
+        df_long["value"].astype(str).str.extract(r"(\d+\.?\d*)")[0],
+        errors="coerce",
+    )
+
+    dt = pd.to_datetime(
+        df_long["period"].astype(str).str.strip().str.replace("M", "-", regex=False),
+        format="%Y-%m",
+        errors="coerce",
+    )
+
+    # Use month-end timestamps to align with other monthly series in this dashboard
+    df_long["date"] = dt + pd.offsets.MonthEnd(0)
+
+    df_pivot = (
+        df_long.pivot_table(index="date", columns="coicop", values="value")
+        .rename(columns={"CP00": "Headline", "TOT_X_NRG_FOOD": "Core"})
+        .sort_index()
+    )
+
+    return df_pivot.dropna()
+
+
+def calculate_hicp_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute YoY inflation, 3m/3m annualized momentum, and core index + SMAs."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    data = df.copy().sort_index()
+
+    # Year-over-year inflation (YoY)
+    if "Headline" in data.columns:
+        data["Headline YoY"] = data["Headline"].pct_change(12) * 100.0
+    if "Core" in data.columns:
+        data["Core YoY"] = data["Core"].pct_change(12) * 100.0
+
+    # 3m/3m annualized momentum (based on 3m moving average)
+    for col in ["Headline", "Core"]:
+        if col not in data.columns:
+            continue
+        avg_3m = data[col].rolling(window=3).mean()
+        data[f"{col} 3m/3m Annualized"] = ((avg_3m / avg_3m.shift(3)) ** 4 - 1.0) * 100.0
+
+    # Core index (initially rebased; will be rebased again at chart start)
+    if "Core" in data.columns and not data["Core"].dropna().empty:
+        data["Core Index"] = (data["Core"] / float(data["Core"].iloc[0])) * 100.0
+        data["Core SMA 6"] = data["Core Index"].rolling(window=6).mean()
+        data["Core SMA 12"] = data["Core Index"].rolling(window=12).mean()
+
+    return data
+
+
+def build_inflation_figs(start_date: str = "2005-01-01"):
+    """Build the inflation panel figures (Plotly, dashboard style)."""
+    df_raw = fetch_eurostat_hicp_midx()
+    if df_raw is None or df_raw.empty:
+        src = ["Eurostat SDMX API: prc_hicp_midx (HICP monthly index)"]
+        return (None, ["Eurostat HICP data unavailable (fetch failed or empty)."], src), (None, None, src), (None, None, src)
+
+    dfm = calculate_hicp_metrics(df_raw)
+
+    start_dt = pd.to_datetime(start_date)
+    dfp = dfm[dfm.index >= start_dt].copy()
+
+    # Rebase core index to 100 at chart start (e.g., Jan 2005)
+    if "Core" in dfp.columns and not dfp["Core"].dropna().empty:
+        dfp["Core Index"] = (dfp["Core"] / float(dfp["Core"].iloc[0])) * 100.0
+        dfp["Core SMA 6"] = dfp["Core Index"].rolling(window=6).mean()
+        dfp["Core SMA 12"] = dfp["Core Index"].rolling(window=12).mean()
+
+    dfp = dfp.dropna()
+
+    src = ["Eurostat SDMX API: prc_hicp_midx (EA20, unit=I15; CP00 headline; TOT_X_NRG_FOOD core)"]
+
+    if dfp.empty:
+        return (None, ["Eurostat HICP data unavailable after filtering."], src), (None, None, src), (None, None, src)
+
+    x0 = dfp.index.min()
+    x1 = dfp.index.max()
+    last_dt = pd.to_datetime(dfp.index[-1])
+
+    # -----------------------------------------------------------------------------
+    # FIG 1: Headline vs Core YoY + target band (1–3) and 2% line
+    # -----------------------------------------------------------------------------
+    shapes1 = [
+        {
+            "type": "rect",
+            "xref": "x",
+            "yref": "y",
+            "x0": x0,
+            "x1": x1,
+            "y0": 1,
+            "y1": 3,
+            "fillcolor": "rgba(239,68,68,0.12)",
+            "line": {"width": 0},
+            "layer": "below",
+        },
+        {
+            "type": "line",
+            "xref": "x",
+            "yref": "y",
+            "x0": x0,
+            "x1": x1,
+            "y0": 2,
+            "y1": 2,
+            "line": {"color": COLORS["RED"], "width": 2, "dash": "dash"},
+        },
+        {
+            "type": "line",
+            "xref": "x",
+            "yref": "y",
+            "x0": x0,
+            "x1": x1,
+            "y0": 0,
+            "y1": 0,
+            "line": {"color": "black", "width": 1},
+        },
+    ]
+
+    data1 = [
+        {
+            "type": "scatter",
+            "mode": "lines",
+            "name": "Headline HICP (YoY)",
+            "x": dfp.index,
+            "y": dfp["Headline YoY"].values.astype(float),
+            "line": {"width": 2.2, "color": COLORS["BLACK"]},
+        },
+        {
+            "type": "scatter",
+            "mode": "lines",
+            "name": "Core HICP (YoY)",
+            "x": dfp.index,
+            "y": dfp["Core YoY"].values.astype(float),
+            "line": {"width": 2.2, "color": COLORS["DARK_BLUE"]},
+        },
+    ]
+
+    layout1 = {
+        "xaxis": {"title": "", "tickformat": "%Y", "dtick": "M24"},
+        "yaxis": {"title": "YoY Change %"},
+        "shapes": shapes1,
+        "legend": {"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.25},
+        "margin": {"l": 60, "r": 60, "t": 45, "b": 95},
+    }
+
+    fig1 = _fig_from_spec(data1, layout1, height=520)
+
+    obs1 = [
+        f"Latest (as of {last_dt.strftime('%Y-%m')}): Headline {float(dfp['Headline YoY'].iloc[-1]):.1f}%, Core {float(dfp['Core YoY'].iloc[-1]):.1f}%.",
+        "Red band shows 1–3% range; dashed line marks 2%.",
+    ]
+
+    # -----------------------------------------------------------------------------
+    # FIG 2: Momentum (3m/3m annualized) in stacked panels
+    # -----------------------------------------------------------------------------
+    fig_sub = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.10)
+
+    fig_sub.add_trace(
+        go.Bar(
+            x=dfp.index,
+            y=dfp["Headline 3m/3m Annualized"].values.astype(float),
+            name="Headline 3m/3m",
+            marker_color=COLORS["BLACK"],
+            opacity=1.0,
+        ),
+        row=1,
+        col=1,
+    )
+    fig_sub.add_trace(
+        go.Bar(
+            x=dfp.index,
+            y=dfp["Core 3m/3m Annualized"].values.astype(float),
+            name="Core 3m/3m",
+            marker_color=COLORS["DARK_BLUE"],
+            opacity=1.0,
+        ),
+        row=2,
+        col=1,
+    )
+
+    fig_sub.update_yaxes(title_text="Headline (%)", row=1, col=1)
+    fig_sub.update_yaxes(title_text="Core (%)", row=2, col=1)
+    fig_sub.update_xaxes(tickformat="%Y", dtick="M24")
+
+    shapes2 = [
+        {"type": "line", "xref": "x", "yref": "y", "x0": x0, "x1": x1, "y0": 0, "y1": 0, "line": {"color": "black", "width": 1}},
+        {"type": "line", "xref": "x", "yref": "y2", "x0": x0, "x1": x1, "y0": 0, "y1": 0, "line": {"color": "black", "width": 1}},
+    ]
+
+    layout2 = fig_sub.layout.to_plotly_json()
+    layout2.update(
+        {
+            "shapes": shapes2,
+            "legend": {"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.28},
+            "margin": {"l": 60, "r": 60, "t": 45, "b": 105},
+        }
+    )
+
+    fig2 = _fig_from_spec(list(fig_sub.data), layout2, height=740)
+
+    obs2 = [
+        f"Latest momentum (as of {last_dt.strftime('%Y-%m')}): Headline {float(dfp['Headline 3m/3m Annualized'].iloc[-1]):+.1f}%, Core {float(dfp['Core 3m/3m Annualized'].iloc[-1]):+.1f}%.",
+        "Momentum is 3m/3m annualized, based on a 3-month moving average of index levels.",
+    ]
+
+    # -----------------------------------------------------------------------------
+    # FIG 3: Core index + SMAs (rebased to 100 at chart start)
+    # -----------------------------------------------------------------------------
+    data3 = [
+        {
+            "type": "scatter",
+            "mode": "lines",
+            "name": "Core Index",
+            "x": dfp.index,
+            "y": dfp["Core Index"].values.astype(float),
+            "line": {"width": 2.2, "color": COLORS["BLACK"]},
+        },
+        {
+            "type": "scatter",
+            "mode": "lines",
+            "name": "6-Month SMA",
+            "x": dfp.index,
+            "y": dfp["Core SMA 6"].values.astype(float),
+            "line": {"width": 2.0, "color": COLORS["DARK_BLUE"], "dash": "dash"},
+        },
+        {
+            "type": "scatter",
+            "mode": "lines",
+            "name": "12-Month SMA",
+            "x": dfp.index,
+            "y": dfp["Core SMA 12"].values.astype(float),
+            "line": {"width": 2.0, "color": COLORS["DARK_RED"], "dash": "dash"},
+        },
+    ]
+
+    layout3 = {
+        "xaxis": {"title": "", "tickformat": "%Y", "dtick": "M24"},
+        "yaxis": {"title": "Index"},
+        "legend": {"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.25},
+        "margin": {"l": 60, "r": 60, "t": 45, "b": 95},
+    }
+
+    fig3 = _fig_from_spec(data3, layout3, height=620)
+
+    cum = float(dfp["Core Index"].iloc[-1]) - 100.0
+    obs3 = [
+        f"Cumulative core price-level change since {start_dt.strftime('%b %Y')}: {cum:+.1f} index points.",
+        "Dashed lines show 6- and 12-month moving averages of the rebased core index.",
+    ]
+
+    return (fig1, obs1, src), (fig2, obs2, src), (fig3, obs3, src)
+
+
+
+# =============================================================================
+# FINANCIAL CONDITIONS & LIQUIDITY (CISS vs Net Liquidity proxy) (CACHED)
+# =============================================================================
+def _parse_ecb_time_period_robust(tp: pd.Series) -> pd.DatetimeIndex:
+    """Robust ECB TIME_PERIOD parsing (daily / monthly / ISO-weekly)."""
+    s = tp.astype(str).str.strip()
+
+    # Weekly ISO format: YYYY-Www
+    if s.str.contains("W").any():
+        dt = pd.to_datetime(s + "-1", format="%G-W%V-%u", errors="coerce")  # Monday
+        return pd.DatetimeIndex(dt)
+
+    # Monthly: YYYY-MM -> month-end
+    if s.str.fullmatch(r"\d{4}-\d{2}").all():
+        dt = pd.PeriodIndex(s, freq="M").to_timestamp("M")
+        return pd.DatetimeIndex(dt)
+
+    # Daily: YYYY-MM-DD
+    if s.str.fullmatch(r"\d{4}-\d{2}-\d{2}").all():
+        dt = pd.to_datetime(s, format="%Y-%m-%d", errors="coerce")
+        # If it looks like monthly delivered as YYYY-MM-01, shift to month-end (heuristic)
+        if s.str.endswith("-01").all() and len(s) < 2000:
+            dt = dt.to_period("M").to_timestamp("M")
+        return pd.DatetimeIndex(dt)
+
+    # Fallback
+    return pd.DatetimeIndex(pd.to_datetime(s, errors="coerce"))
+
+
+def _ecb_panel_to_series_robust(df_panel: pd.DataFrame) -> pd.Series:
+    """Convert ECB SDMX-CSV panel to a pd.Series with robust time parsing."""
+    if df_panel is None or df_panel.empty:
+        return pd.Series(dtype=float)
+
+    if "TIME_PERIOD" not in df_panel.columns or "OBS_VALUE" not in df_panel.columns:
+        return pd.Series(dtype=float)
+
+    df = df_panel[["TIME_PERIOD", "OBS_VALUE"]].dropna()
+    if df.empty:
+        return pd.Series(dtype=float)
+
+    idx = _parse_ecb_time_period_robust(df["TIME_PERIOD"])
+    vals = pd.to_numeric(df["OBS_VALUE"], errors="coerce")
+
+    s = pd.Series(vals.values, index=idx).dropna().sort_index()
+    s = s[~s.index.duplicated(keep="last")]
+    return s.sort_index()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_ecb_series_robust(flow: str, key: str, start_period: str) -> pd.Series:
+    """Fetch a single ECB time series (robust TIME_PERIOD parsing)."""
+    panel = ecb_get_panel(flow, key, start_period)
+    return _ecb_panel_to_series_robust(panel)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_eu_liquidity_dashboard(
+    start: str = FINCOND_START_DATE,
+    liq_smooth_days: int = FINCOND_LIQ_SMOOTH_DAYS,
+) -> tuple[pd.DataFrame, str]:
+    """EU Liquidity & Financial Stress dashboard (daily grid, forward-filled)."""
+    # Stress (daily)
+    ciss_daily = get_ecb_series_robust("CISS", FINCOND_CISS_KEY, start)
+
+    # Liquidity components
+    assets_w = get_ecb_series_robust("ILM", FINCOND_ASSETS_KEY, start)       # weekly
+    govdep_mp = get_ecb_series_robust("ILM", FINCOND_GOVDEP_MP_KEY, start)   # monthly (often shorter/patchy)
+
+    if govdep_mp.dropna().shape[0] < 24:
+        govdep = get_ecb_series_robust("ILM", FINCOND_GOVDEP_EOP_KEY, start) # monthly (longer)
+        govdep_source = "EOP (L050100)"
+    else:
+        govdep = govdep_mp
+        govdep_source = "MP (L050100MP)"
+
+    debtcert_w = get_ecb_series_robust("ILM", FINCOND_DEBTCERT_KEY, start)   # weekly
+    ftd_m = get_ecb_series_robust("ILM", FINCOND_FTD_KEY, start)             # monthly
+
+    df = pd.concat(
+        [ciss_daily, assets_w, govdep, debtcert_w, ftd_m],
+        axis=1,
+        keys=["CISS", "Assets", "GovDeposits", "DebtCert", "FixedTermDeposits"],
+    ).sort_index()
+
+    if df.empty:
+        return pd.DataFrame(), govdep_source
+
+    # Combine on a daily grid and forward-fill (connect points)
+    df = df.resample("D").ffill().bfill()
+
+    # If any of the drains are still missing, fill with 0 to avoid breaks in the proxy
+    for col in ["GovDeposits", "DebtCert", "FixedTermDeposits"]:
+        if col in df.columns:
+            df[col] = df[col].fillna(0.0)
+
+    # Net Liquidity proxy (Millions EUR)
+    df["NetLiq_mn"] = df["Assets"] - df["GovDeposits"] - df["DebtCert"] - df["FixedTermDeposits"]
+
+    # 5-day average for liquidity proxy (calendar days)
+    if liq_smooth_days and liq_smooth_days > 1:
+        df["NetLiq_5d_mn"] = df["NetLiq_mn"].rolling(liq_smooth_days, min_periods=1).mean()
+    else:
+        df["NetLiq_5d_mn"] = df["NetLiq_mn"]
+
+    # Keep CISS as-is (daily); ensure no breaks
+    df["CISS_plot"] = df["CISS"].interpolate(method="time").ffill().bfill()
+
+    df = df[df.index >= pd.to_datetime(start)]
+    return df, govdep_source
+
+
+def build_financial_conditions_liquidity_fig(
+    start_date: str = FINCOND_START_DATE,
+    liq_smooth_days: int = FINCOND_LIQ_SMOOTH_DAYS,
+):
+    """Single chart: CISS (left) vs Net Liquidity proxy (right), both solid lines."""
+    df, govdep_source = get_eu_liquidity_dashboard(start=start_date, liq_smooth_days=liq_smooth_days)
+
+    src = [
+        "ECB Data API: CISS dataset (CISS), ILM dataset (Assets, Gov. deposits, Debt certificates, Fixed-term deposits)",
+    ]
+
+    if df is None or df.empty:
+        obs = ["ECB liquidity / CISS data unavailable (fetch failed or empty)."]
+        return None, obs, src
+
+    ciss = df["CISS_plot"].dropna()
+    netliq_tn = (df["NetLiq_5d_mn"] / 1_000_000.0).dropna()  # mn -> tn
+
+    if ciss.empty or netliq_tn.empty:
+        obs = ["ECB liquidity / CISS data unavailable after alignment."]
+        return None, obs, src
+
+    start_dt = pd.to_datetime(start_date)
+    max_dt = pd.to_datetime(df.index.max())
+
+    data = [
+        {
+            "type": "scatter",
+            "mode": "lines",
+            "name": "CISS",
+            "x": ciss.index,
+            "y": ciss.values.astype(float),
+            "line": {"width": 2.2, "color": COLORS["DARK_BLUE"]},
+        },
+        {
+            "type": "scatter",
+            "mode": "lines",
+            "name": "Net Liquidity Proxy",
+            "x": netliq_tn.index,
+            "y": netliq_tn.values.astype(float),
+            "yaxis": "y2",
+            "line": {"width": 2.2, "color": COLORS["BLACK"]},
+        },
+    ]
+
+    layout = {
+        "xaxis": {"title": "", "tickformat": "%Y", "dtick": "M12", "range": [start_dt, max_dt], "domain": [0.0, 0.86]},
+        "yaxis": {"title": "CISS (index)"},
+        "yaxis2": {"title": "Net Liquidity Proxy (Trillion €)", "overlaying": "y", "side": "right", "showgrid": False, "anchor": "free", "position": 0.90},
+        "legend": {"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.25},
+        "margin": {"l": 60, "r": 110, "t": 45, "b": 95},
+    }
+
+    fig = _fig_from_spec(data, layout, height=650)
+
+    last_dt = pd.to_datetime(df.index.max())
+    obs = [
+        f"CISS: [Composite Indicator of Systemic Stress for EA] - Aggregates stress across Banks, Money, Equity, Bonds and FX Markets. 1 indicates high systemic risk, values below 0.3 generally stable financial conditions.",
+        f"Net liquidity proxy = Assets − GovDeposits − DebtCert − FixedTermDepositsi ({liq_smooth_days}-day average).",
+        f"GovDeposits source chosen: {govdep_source}.",
+    ]
+
+    return fig, obs, src
+
 def build_gold_figs():
     """Gold in EUR + trend band + M2 + M2 YoY (top) and net trade flow (bottom)."""
     if yf is None:
@@ -1420,6 +1938,15 @@ def load_dashboard_data() -> dict:
     # Gold & liquidity
     gold_top, gold_bot, gold_obs, gold_src = build_gold_figs()
 
+
+    # Inflation (Eurostat HICP)
+    infl_pack = build_inflation_figs(start_date="2005-01-01")
+
+    # Financial Conditions & Liquidity (ECB CISS + net liquidity proxy)
+    fincond_pack = build_financial_conditions_liquidity_fig(
+        start_date=FINCOND_START_DATE,
+        liq_smooth_days=FINCOND_LIQ_SMOOTH_DAYS,
+    )
     # KPI payloads
     kpis = []
     for payload in [
@@ -1441,6 +1968,8 @@ def load_dashboard_data() -> dict:
         "money_market_long": (mm_fig_long, mm_obs_long, mm_src_long, mm_start_long),
         "money_market_short": (mm_fig_short, mm_obs_short, mm_src_short, mm_start_short),
         "gold": (gold_top, gold_bot, gold_obs, gold_src),
+        "inflation": infl_pack,
+        "financial_conditions_liquidity": fincond_pack,
     }
 
 def main():
@@ -1481,7 +2010,7 @@ def main():
     # Navigation (radio as pill tabs)
     page = st.radio(
         "Navigation",
-        ["Monetary Policy", "Yield Curve", "Money Market", "Gold & Liquidity"],
+        ["Monetary Policy", "Inflation", "Yield Curve", "Money Market", "Financial Conditions & Liquidity", "Gold & Liquidity"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -1492,6 +2021,18 @@ def main():
     if page == "Monetary Policy":
         fig, obs, src = data["policy"]
         _show_chart("Monetary Policy Path: €STR vs Market-implied path", fig, obs, src)
+
+    # ===== INFLATION =====
+    elif page == "Inflation":
+        (fig1, obs1, src1), (fig2, obs2, src2), (fig3, obs3, src3) = data["inflation"]
+
+        _show_chart("Headline vs Core Inflation", fig1, obs1, src1)
+
+        st.markdown("---")
+        _show_chart("Momentum - 3m/3m Annualized", fig2, obs2, src2)
+
+        st.markdown("---")
+        _show_chart("Core Inflation Index & Moving Averages", fig3, obs3, src3)
 
     # ===== YIELD CURVE =====
     elif page == "Yield Curve":
@@ -1564,7 +2105,14 @@ def main():
         st.markdown("</div>", unsafe_allow_html=True)
 
 
+
+    # ===== FINANCIAL CONDITIONS & LIQUIDITY =====
+    elif page == "Financial Conditions & Liquidity":
+        fig, obs, src = data["financial_conditions_liquidity"]
+        _show_chart("Euro Area Stress vs Net Liquidity Proxy", fig, obs, src)
+
     # ===== GOLD & LIQUIDITY =====
+
     elif page == "Gold & Liquidity":
         st.header("Gold & Liquidity")
 
