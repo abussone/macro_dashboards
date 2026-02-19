@@ -703,7 +703,9 @@ def build_yield_curve_figs(lookback_months: int = 24, spread_years: int = 5):
             latest_total_dt = df_total_m.index[-1]
             xcats = [t for t in order if t in df_total_m.columns]
             xvals = [_tenor_to_years(t) for t in xcats]
-            curve_hover = "Tenor: %{customdata}<br>Yield: %{y:.2f}%<extra>%{fullData.name}</extra>"
+            tenor_map = {float(x): t for x, t in zip(xvals, xcats)}
+            tenor_labels = [tenor_map.get(float(x), str(x)) for x in xvals]
+            curve_hover = "%{y:.2f}%<extra>%{fullData.name}</extra>"
 
             data1 = []
             # older snapshots (fading)
@@ -725,6 +727,20 @@ def build_yield_curve_figs(lookback_months: int = 24, spread_years: int = 5):
 
             # latest Total EA
             row_total_latest = df_total_m.loc[latest_total_dt]
+            # Invisible helper trace: prints mapped tenor labels (3M/6M/10Y) in unified hover.
+            data1.append(
+                {
+                    "type": "scatter",
+                    "mode": "lines",
+                    "name": "",
+                    "x": xvals,
+                    "y": [float(row_total_latest[t]) for t in xcats],
+                    "text": tenor_labels,
+                    "hovertemplate": "Tenor %{text}<extra></extra>",
+                    "line": {"width": 0, "color": "rgba(0,0,0,0)"},
+                    "showlegend": False,
+                }
+            )
             data1.append(
                 {
                     "type": "scatter",
@@ -732,6 +748,7 @@ def build_yield_curve_figs(lookback_months: int = 24, spread_years: int = 5):
                     "name": f"Latest Total EA ({latest_total_dt.strftime('%Y-%m')})",
                     "x": xvals,
                     "y": [float(row_total_latest[t]) for t in xcats],
+                    "text": xcats,
                     "customdata": xcats,
                     "hovertemplate": curve_hover,
                     "line": {"width": 3.2, "color": COLORS["DARK_BLUE"]},
@@ -757,6 +774,7 @@ def build_yield_curve_figs(lookback_months: int = 24, spread_years: int = 5):
                                 "name": f"Latest AAA ({latest_aaa_dt.strftime('%Y-%m')})",
                                 "x": xvals_aaa,
                                 "y": [float(row_aaa_latest[t]) for t in xcats_aaa],
+                                "text": xcats_aaa,
                                 "customdata": xcats_aaa,
                                 "hovertemplate": curve_hover,
                                 "line": {"width": 3.2, "color": COLORS["BLACK"]},
@@ -789,7 +807,7 @@ def build_yield_curve_figs(lookback_months: int = 24, spread_years: int = 5):
                     "title": "Maturity (years)",
                     "type": "linear",
                     "range": [0.0, (max(xvals) * 1.03) if xvals else 30.0],
-                    "unifiedhovertitle": {"text": "Tenor: %{customdata}"},
+                    "unifiedhovertitle": {"text": ""},
                     "tickangle": 0,
                     "tickfont": {"size": 11},
                     "automargin": True,

@@ -1259,7 +1259,9 @@ def build_yield_curve_figs(lookback_months: int = 24):
 
     xcats = [t for t in YIELD_CURVE_ORDER if t in df_monthly.columns]
     xvals = [_tenor_to_years(t) for t in xcats]
-    curve_hover = "Tenor: %{customdata}<br>Yield: %{y:.2f}%<extra>%{fullData.name}</extra>"
+    tenor_map = {float(x): t for x, t in zip(xvals, xcats)}
+    tenor_labels = [tenor_map.get(float(x), str(x)) for x in xvals]
+    curve_hover = "%{y:.2f}%<extra>%{fullData.name}</extra>"
     data1 = []
     for dt in df_monthly.index[:-2]:
         row = df_monthly.loc[dt]
@@ -1277,6 +1279,22 @@ def build_yield_curve_figs(lookback_months: int = 24):
             }
         )
 
+    # Invisible helper trace: prints mapped tenor labels (3M/6M/10Y) in unified hover.
+    row_hover_anchor = df_monthly.loc[latest_dt]
+    data1.append(
+        {
+            "type": "scatter",
+            "mode": "lines",
+            "name": "",
+            "x": xvals,
+            "y": [float(row_hover_anchor[t]) for t in xcats],
+            "text": tenor_labels,
+            "hovertemplate": "Tenor %{text}<extra></extra>",
+            "line": {"width": 0, "color": "rgba(0,0,0,0)"},
+            "showlegend": False,
+        }
+    )
+
     for dt, color, name in [(prev_dt, "black", f"Prev ({prev_dt.strftime('%Y-%m')})"), (latest_dt, "#0B3D91", f"Latest ({latest_dt.strftime('%Y-%m')})")]:
         row = df_monthly.loc[dt]
         data1.append(
@@ -1286,6 +1304,7 @@ def build_yield_curve_figs(lookback_months: int = 24):
                 "name": name,
                 "x": xvals,
                 "y": [float(row[t]) for t in xcats],
+                "text": xcats,
                 "customdata": xcats,
                 "hovertemplate": curve_hover,
                 "line": {"width": 3.2, "color": color},
@@ -1315,7 +1334,7 @@ def build_yield_curve_figs(lookback_months: int = 24):
             "title": "Maturity (years)",
             "type": "linear",
             "range": [0.0, (max(xvals) * 1.03) if xvals else 30.0],
-            "unifiedhovertitle": {"text": "Tenor: %{customdata}"},
+            "unifiedhovertitle": {"text": ""},
             "tickangle": 0,
             "tickfont": {"size": 11},
             "automargin": True,
