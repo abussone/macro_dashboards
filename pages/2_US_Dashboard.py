@@ -21,6 +21,8 @@ import streamlit as st
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+st.set_page_config(page_title="US Dashboard", page_icon="🇺🇸", layout="wide")
+
 def _resolve_fred_api_key() -> str:
     """Resolve FRED API key from Streamlit secrets or environment variables."""
     try:
@@ -50,7 +52,7 @@ INFLATION_SERIES = {
     5: "T5YIEM",
     7: "T7YIEM",
     10: "T10YIEM",
-    20: "T20YIEM",
+    #20: "T20YIEM",
     30: "T30YIEM",
 }
 
@@ -179,6 +181,16 @@ def _safe_float(x) -> float:
         return float("nan")
 
 
+def _tenor_to_years(tenor: str) -> float:
+    """Convert tenor labels like 3M/1Y/30Y to maturity in years."""
+    t = str(tenor).strip().upper()
+    if t.endswith("M"):
+        return float(t[:-1]) / 12.0
+    if t.endswith("Y"):
+        return float(t[:-1])
+    return float("nan")
+
+
 def _pct_fmt(x, nd=2) -> str:
     return f"{x:.{nd}f}%" if np.isfinite(x) else "n/a"
 
@@ -267,6 +279,7 @@ def _apply_dashboard_style(fig: go.Figure, *, height: int, layout: dict | None =
         title_font=dict(color="black"),
         linecolor="black",
         gridcolor="rgba(0,0,0,0.05)",
+        hoverformat="%Y-%m-%d",
     )
     fig.update_yaxes(
         tickfont=dict(color="black"),
@@ -928,6 +941,7 @@ def build_fomc_figs():
         used_dates.append(t)
     curves = np.array(curves, dtype=float)
 
+    xvals = [float(m) for m in maturities]
     xcats = [f"{m}Y" for m in maturities]
     data2 = []
     for i in range(24, 1, -1):
@@ -936,7 +950,7 @@ def build_fomc_figs():
                 "type": "scatter",
                 "mode": "lines+markers",
                 "name": f"{used_dates[i].strftime('%Y-%m')}",
-                "x": xcats,
+                "x": xvals,
                 "y": [float(x) for x in curves[i]],
                 "line": {"width": 2, "color": "lightgrey"},
                 "marker": {"size": 6, "color": "lightgrey"},
@@ -947,14 +961,14 @@ def build_fomc_figs():
         )
 
     data2.append(
-        {"type": "scatter", "mode": "lines+markers", "name": f"1 month earlier ({used_dates[1].strftime('%Y-%m')})", "x": xcats, "y": [float(x) for x in curves[1]], "line": {"width": 3, "color": "black"}, "marker": {"size": 7, "color": "black"}}
+        {"type": "scatter", "mode": "lines+markers", "name": f"1 month earlier ({used_dates[1].strftime('%Y-%m')})", "x": xvals, "y": [float(x) for x in curves[1]], "line": {"width": 3, "color": "black"}, "marker": {"size": 7, "color": "black"}}
     )
     data2.append(
-        {"type": "scatter", "mode": "lines+markers", "name": f"Latest ({used_dates[0].strftime('%Y-%m')})", "x": xcats, "y": [float(x) for x in curves[0]], "line": {"width": 3.5, "color": "#0B3D91"}, "marker": {"size": 8, "color": "#0B3D91"}}
+        {"type": "scatter", "mode": "lines+markers", "name": f"Latest ({used_dates[0].strftime('%Y-%m')})", "x": xvals, "y": [float(x) for x in curves[0]], "line": {"width": 3.5, "color": "#0B3D91"}, "marker": {"size": 8, "color": "#0B3D91"}}
     )
 
     layout2 = {
-        "xaxis": {"title": "Maturity", "type": "category"},
+        "xaxis": {"title": "Maturity", "type": "linear", "tickmode": "array", "tickvals": xvals, "ticktext": xcats},
         "yaxis": {"title": "Percent"},
         "legend": {"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.25},
         "margin": {"l": 60, "r": 60, "t": 35, "b": 95},
@@ -1244,6 +1258,8 @@ def build_yield_curve_figs(lookback_months: int = 24):
     prev_dt = df_monthly.index[-2]
 
     xcats = [t for t in YIELD_CURVE_ORDER if t in df_monthly.columns]
+    xvals = [_tenor_to_years(t) for t in xcats]
+    curve_hover = "Tenor: %{customdata}<br>Yield: %{y:.2f}%<extra>%{fullData.name}</extra>"
     data1 = []
     for dt in df_monthly.index[:-2]:
         row = df_monthly.loc[dt]
@@ -1251,8 +1267,8 @@ def build_yield_curve_figs(lookback_months: int = 24):
             {
                 "type": "scatter",
                 "mode": "lines+markers",
-                "name": dt.strftime("%Y-%m"),
-                "x": xcats,
+                "name": "",
+                "x": xvals,
                 "y": [float(row[t]) for t in xcats],
                 "line": {"width": 1, "color": "rgba(160,160,160,0.55)"},
                 "marker": {"size": 4, "color": "rgba(160,160,160,0.55)"},
@@ -1268,8 +1284,10 @@ def build_yield_curve_figs(lookback_months: int = 24):
                 "type": "scatter",
                 "mode": "lines+markers",
                 "name": name,
-                "x": xcats,
+                "x": xvals,
                 "y": [float(row[t]) for t in xcats],
+                "customdata": xcats,
+                "hovertemplate": curve_hover,
                 "line": {"width": 3.2, "color": color},
                 "marker": {"size": 6, "color": color},
             }
@@ -1292,7 +1310,16 @@ def build_yield_curve_figs(lookback_months: int = 24):
     src = [f"FRED series: {', '.join(YIELD_CURVE_SERIES.keys())}"]
 
     layout1 = {
-        "xaxis": {"title": "Maturity", "type": "category"},
+        "hovermode": "x unified",
+        "xaxis": {
+            "title": "Maturity (years)",
+            "type": "linear",
+            "range": [0.0, (max(xvals) * 1.03) if xvals else 30.0],
+            "unifiedhovertitle": {"text": "Tenor: %{customdata}"},
+            "tickangle": 0,
+            "tickfont": {"size": 11},
+            "automargin": True,
+        },
         "yaxis": {"title": "Yield (%)"},
         "legend": {"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.25},
         "margin": {"l": 60, "r": 60, "t": 35, "b": 95},
@@ -1476,9 +1503,96 @@ def mm_plot_stress_spread(
 
     label = f"{labels[idx1]} - {labels[idx2]} (Latest: {last_val:.2f} {status})"
 
-    data = [
-        {"type": "scatter", "mode": "lines", "name": label, "x": merged["date"], "y": diff.values.astype(float), "line": {"width": 2.6, "color": "#0B3D91"}}
-    ]
+    yvals = diff.values.astype(float)
+    xvals = pd.to_datetime(merged["date"]).reset_index(drop=True)
+
+    def _add_segment(xs: list, ys: list, x0, y0: float, x1, y1: float) -> None:
+        xs.extend([x0, x1, None])
+        ys.extend([float(y0), float(y1), None])
+
+    x_pos: list = []
+    y_pos: list[float | None] = []
+    x_neg: list = []
+    y_neg: list[float | None] = []
+
+    for i in range(len(yvals) - 1):
+        y0 = float(yvals[i])
+        y1 = float(yvals[i + 1])
+        if not (np.isfinite(y0) and np.isfinite(y1)):
+            continue
+
+        x0 = xvals.iloc[i]
+        x1 = xvals.iloc[i + 1]
+        s0 = 1 if y0 > 0 else (-1 if y0 < 0 else 0)
+        s1 = 1 if y1 > 0 else (-1 if y1 < 0 else 0)
+
+        if s0 >= 0 and s1 >= 0 and not (s0 == 0 and s1 == 0):
+            _add_segment(x_pos, y_pos, x0, y0, x1, y1)
+            continue
+        if s0 <= 0 and s1 <= 0 and not (s0 == 0 and s1 == 0):
+            _add_segment(x_neg, y_neg, x0, y0, x1, y1)
+            continue
+
+        if s0 == 0 and s1 == 0:
+            continue
+
+        if s0 * s1 < 0:
+            denom = abs(y0) + abs(y1)
+            frac = abs(y0) / denom if denom else 0.5
+            x_cross = x0 + (x1 - x0) * frac
+            if s0 > 0:
+                _add_segment(x_pos, y_pos, x0, y0, x_cross, 0.0)
+                _add_segment(x_neg, y_neg, x_cross, 0.0, x1, y1)
+            else:
+                _add_segment(x_neg, y_neg, x0, y0, x_cross, 0.0)
+                _add_segment(x_pos, y_pos, x_cross, 0.0, x1, y1)
+            continue
+
+        if s0 == 0:
+            if s1 > 0:
+                _add_segment(x_pos, y_pos, x0, y0, x1, y1)
+            elif s1 < 0:
+                _add_segment(x_neg, y_neg, x0, y0, x1, y1)
+        elif s1 == 0:
+            if s0 > 0:
+                _add_segment(x_pos, y_pos, x0, y0, x1, y1)
+            elif s0 < 0:
+                _add_segment(x_neg, y_neg, x0, y0, x1, y1)
+
+    data = []
+    if x_pos:
+        data.append(
+            {
+                "type": "scatter",
+                "mode": "lines",
+                "name": f"{label} (>0)",
+                "x": x_pos,
+                "y": y_pos,
+                "line": {"width": 2.6, "color": "#8B0000"},
+            }
+        )
+    if x_neg:
+        data.append(
+            {
+                "type": "scatter",
+                "mode": "lines",
+                "name": f"{label} (<0)",
+                "x": x_neg,
+                "y": y_neg,
+                "line": {"width": 2.6, "color": "#0B6E4F"},
+            }
+        )
+    if not data:
+        data = [
+            {
+                "type": "scatter",
+                "mode": "lines",
+                "name": label,
+                "x": merged["date"],
+                "y": yvals,
+                "line": {"width": 2.0, "color": "#4A5568"},
+            }
+        ]
     shapes = [
         {"type": "line", "xref": "x", "yref": "y", "x0": merged["date"].iloc[0], "x1": merged["date"].iloc[-1], "y0": 0, "y1": 0, "line": {"color": "black", "width": 1}}
     ]
@@ -2378,7 +2492,7 @@ def main():
 
     page = st.radio(
         "Navigation",
-        ["Monetary Policy", "Inflation", "Yield Curve", "Money Market", "Financial Conditions & Liquidity", "Hedge Funds", "Gold & Liquidity"],
+        ["Monetary Policy", "Inflation", "Yield Curve", "Money Market", "Hedge Funds", "Financial Conditions & Liquidity", "Gold & Liquidity"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -2393,7 +2507,7 @@ def main():
 
         st.markdown("---")
         fig2, obs2, src2 = data["fomc"]["breakevens"]
-        _show_chart("Breakeven Market-implied Breakeven Inflation Expectations", fig2, obs2, src2)
+        _show_chart("Market-implied Breakeven Inflation Expectations", fig2, obs2, src2)
 
     # ===== YIELD CURVE =====
 

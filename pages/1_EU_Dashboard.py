@@ -31,6 +31,7 @@ COLORS = {
 }
 
 ECB_DATA_API = "https://data-api.ecb.europa.eu/service/data"
+FRED_GRAPH_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 START_DATE_GLOBAL = "2015-01-01"
 START_DATE_POLICY = "2020-01-01"
 
@@ -265,6 +266,16 @@ def _safe_float(x) -> float:
         return float("nan")
 
 
+def _tenor_to_years(tenor: str) -> float:
+    """Convert tenor label like 3M/1Y/30Y to maturity in years."""
+    t = str(tenor).strip().upper()
+    if t.endswith("M"):
+        return float(t[:-1]) / 12.0
+    if t.endswith("Y"):
+        return float(t[:-1])
+    return float("nan")
+
+
 def _fig_from_spec(data: list[dict], layout: dict, height: int) -> go.Figure:
     """Build a Plotly figure from dict specs (keeps your existing trace/layout logic).
 
@@ -288,9 +299,15 @@ def _fig_from_spec(data: list[dict], layout: dict, height: int) -> go.Figure:
             if xs is not None and len(xs) > 0:
                 idxs = np.linspace(0, len(xs) - 1, num=min(5, len(xs)), dtype=int)
                 sample = [xs[i] for i in idxs]
-                parsed = pd.to_datetime(sample, errors="coerce")
-                if hasattr(parsed, "notna") and float(parsed.notna().mean()) >= 0.6:
-                    fig.update_xaxes(type="date")
+                # Guard: numeric x values (e.g., horizontal bars) must stay linear, not date.
+                is_numeric_sample = all(
+                    isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)
+                    for v in sample
+                )
+                if not is_numeric_sample:
+                    parsed = pd.to_datetime(sample, errors="coerce")
+                    if hasattr(parsed, "notna") and float(parsed.notna().mean()) >= 0.6:
+                        fig.update_xaxes(type="date")
     except Exception:
         pass
 
@@ -334,7 +351,13 @@ def _fig_from_spec(data: list[dict], layout: dict, height: int) -> go.Figure:
         pass
 
     # Force axis colors to black
-    fig.update_xaxes(tickfont=dict(color="black"), title_font=dict(color="black"), linecolor="black", gridcolor="rgba(0,0,0,0.05)")
+    fig.update_xaxes(
+        tickfont=dict(color="black"),
+        title_font=dict(color="black"),
+        linecolor="black",
+        gridcolor="rgba(0,0,0,0.05)",
+        hoverformat="%Y-%m-%d",
+    )
     fig.update_yaxes(tickfont=dict(color="black"), title_font=dict(color="black"), linecolor="black", gridcolor="rgba(0,0,0,0.05)")
 
     # --- Keep bottom legends inside the figure canvas (no scrollbars) ---
@@ -679,6 +702,8 @@ def build_yield_curve_figs(lookback_months: int = 24, spread_years: int = 5):
         if not df_total_m.empty:
             latest_total_dt = df_total_m.index[-1]
             xcats = [t for t in order if t in df_total_m.columns]
+            xvals = [_tenor_to_years(t) for t in xcats]
+            curve_hover = "Tenor: %{customdata}<br>Yield: %{y:.2f}%<extra>%{fullData.name}</extra>"
 
             data1 = []
             # older snapshots (fading)
@@ -688,8 +713,8 @@ def build_yield_curve_figs(lookback_months: int = 24, spread_years: int = 5):
                     {
                         "type": "scatter",
                         "mode": "lines+markers",
-                        "name": dt.strftime("%Y-%m"),
-                        "x": xcats,
+                        "name": "",
+                        "x": xvals,
                         "y": [float(row[t]) for t in xcats],
                         "line": {"width": 1, "color": "rgba(160,160,160,0.55)"},
                         "marker": {"size": 4, "color": "rgba(160,160,160,0.55)"},
@@ -705,8 +730,10 @@ def build_yield_curve_figs(lookback_months: int = 24, spread_years: int = 5):
                     "type": "scatter",
                     "mode": "lines+markers",
                     "name": f"Latest Total EA ({latest_total_dt.strftime('%Y-%m')})",
-                    "x": xcats,
+                    "x": xvals,
                     "y": [float(row_total_latest[t]) for t in xcats],
+                    "customdata": xcats,
+                    "hovertemplate": curve_hover,
                     "line": {"width": 3.2, "color": COLORS["DARK_BLUE"]},
                     "marker": {"size": 6, "color": COLORS["DARK_BLUE"]},
                 }
@@ -721,14 +748,17 @@ def build_yield_curve_figs(lookback_months: int = 24, spread_years: int = 5):
                     latest_aaa_dt = df_aaa_m.index[-1]
                     xcats_aaa = [t for t in xcats if t in df_aaa_m.columns]
                     if xcats_aaa:
+                        xvals_aaa = [_tenor_to_years(t) for t in xcats_aaa]
                         row_aaa_latest = df_aaa_m.loc[latest_aaa_dt]
                         data1.append(
                             {
                                 "type": "scatter",
                                 "mode": "lines+markers",
                                 "name": f"Latest AAA ({latest_aaa_dt.strftime('%Y-%m')})",
-                                "x": xcats_aaa,
+                                "x": xvals_aaa,
                                 "y": [float(row_aaa_latest[t]) for t in xcats_aaa],
+                                "customdata": xcats_aaa,
+                                "hovertemplate": curve_hover,
                                 "line": {"width": 3.2, "color": COLORS["BLACK"]},
                                 "marker": {"size": 6, "color": COLORS["BLACK"]},
                             }
@@ -754,7 +784,16 @@ def build_yield_curve_figs(lookback_months: int = 24, spread_years: int = 5):
             ]
 
             layout1 = {
-                "xaxis": {"title": "Maturity", "type": "category"},
+                "hovermode": "x unified",
+                "xaxis": {
+                    "title": "Maturity (years)",
+                    "type": "linear",
+                    "range": [0.0, (max(xvals) * 1.03) if xvals else 30.0],
+                    "unifiedhovertitle": {"text": "Tenor: %{customdata}"},
+                    "tickangle": 0,
+                    "tickfont": {"size": 11},
+                    "automargin": True,
+                },
                 "yaxis": {"title": "Yield (%)"},
                 "legend": {"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.25},
                 "margin": {"l": 60, "r": 60, "t": 45, "b": 85},
@@ -885,6 +924,246 @@ def build_yield_curve_figs(lookback_months: int = 24, spread_years: int = 5):
     fig3, obs3, src3 = _build_spread_fig(base_all_m, "Total Euro Area")
 
     return (fig1, obs1, src1), (fig2, obs2, src2), (fig3, obs3, src3)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fred_series_public(series_id: str, start_date: str = "1900-01-01") -> pd.Series:
+    """Public FRED fetch via fredgraph CSV endpoint (no API key required)."""
+    end_date = pd.Timestamp.today().strftime("%Y-%m-%d")
+    params = {"id": str(series_id).strip(), "cosd": start_date, "coed": end_date}
+
+    try:
+        r = SESSION.get(FRED_GRAPH_URL, params=params, timeout=50)
+        r.raise_for_status()
+        text = (r.text or "").strip()
+        if not text or text.lower().startswith("<!doctype html") or text.lower().startswith("<html"):
+            return pd.Series(dtype=float)
+
+        df = pd.read_csv(StringIO(text))
+        if df.empty:
+            return pd.Series(dtype=float)
+
+        date_col = "DATE" if "DATE" in df.columns else df.columns[0]
+        val_col = series_id if series_id in df.columns else df.columns[-1]
+
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+        df = df.dropna(subset=[date_col, val_col])
+        if df.empty:
+            return pd.Series(dtype=float)
+        return df.set_index(date_col)[val_col].sort_index()
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def build_cross_country_sectoral_debt_latest_fig():
+    """Cross-country stacked debt to GDP chart (latest available quarter)."""
+    countries = {
+        "US": "USA",
+        "XM": "Euro Area",
+        "GB": "UK",
+        "JP": "Japan",
+        "DE": "Germany",
+        "FR": "France",
+        "IT": "Italy",
+    }
+    sectors = {
+        "G": "Government",
+        "H": "Households",
+        "N": "Non-Fin Corps",
+    }
+    colors = {
+        "Government": "#1f77b4",
+        "Households": "#2ca02c",
+        "Non-Fin Corps": "#d62728",
+    }
+
+    # Pull only a 3-year window and take the latest non-null point per series.
+    end_date = pd.Timestamp.today().normalize()
+    start_date = (end_date - pd.Timedelta(days=365 * 3)).strftime("%Y-%m-%d")
+
+    tickers = {}
+    for c_code, c_name in countries.items():
+        for s_code, s_name in sectors.items():
+            sid = f"Q{c_code}{s_code}AM770A"
+            tickers[sid] = {"Country": c_name, "Sector": s_name}
+
+    results = []
+    latest_dates = []
+    for sid, meta in tickers.items():
+        s = fred_series_public(sid, start_date=start_date)
+        valid = pd.to_numeric(s, errors="coerce").dropna().sort_index()
+        if valid.empty:
+            continue
+        results.append(
+            {
+                "Country": meta["Country"],
+                "Sector": meta["Sector"],
+                "Debt_to_GDP": float(valid.iloc[-1]),
+            }
+        )
+        latest_dates.append(pd.to_datetime(valid.index[-1]))
+
+    src = [
+        "FRED BIS credit database series: Q[Country][Sector]AM770A (Government, Households, Non-Financial Corporates)",
+    ]
+    if not results:
+        return None, ["Cross-country sectoral debt data unavailable."], src
+
+    df_results = pd.DataFrame(results)
+    df_pivot = df_results.pivot(index="Country", columns="Sector", values="Debt_to_GDP")
+    if df_pivot.empty:
+        return None, ["Cross-country sectoral debt data unavailable after pivoting."], src
+
+    df_pivot["Total"] = df_pivot.sum(axis=1, min_count=1)
+    df_pivot = df_pivot.sort_values(by="Total", ascending=True).drop(columns=["Total"])
+
+    data = []
+    for sector in ["Government", "Households", "Non-Fin Corps"]:
+        if sector not in df_pivot.columns:
+            continue
+        s = pd.to_numeric(df_pivot[sector], errors="coerce").fillna(0.0)
+        data.append(
+            {
+                "type": "bar",
+                "name": sector,
+                "x": s.values.astype(float),
+                "y": list(df_pivot.index),
+                "orientation": "h",
+                "marker": {"color": colors.get(sector, COLORS["MID_GREY"])},
+                "opacity": 0.9,
+                "width": 0.7,
+            }
+        )
+
+    if not data:
+        return None, ["Cross-country sectoral debt data unavailable after cleaning."], src
+
+    reported_period = max(latest_dates).strftime("%Y-%m") if latest_dates else "n/a"
+    layout = {
+        "title": {"text": f"{reported_period}"},
+        "barmode": "stack",
+        "xaxis": {
+            "title": "Total Debt (% of GDP)",
+            "type": "linear",
+            "showgrid": True,
+            "gridcolor": "rgba(0,0,0,0.12)",
+            "griddash": "dash",
+        },
+        "yaxis": {"title": "", "categoryorder": "array", "categoryarray": list(df_pivot.index)},
+        "legend": {
+            "title": {"text": "Sector (Excl. Financials)"},
+            "orientation": "h",
+            "x": 0.5,
+            "xanchor": "center",
+            "y": -0.25,
+        },
+        "margin": {"l": 120, "r": 40, "t": 45, "b": 95},
+    }
+    fig = _fig_from_spec(data, layout, height=560)
+
+    obs = [
+        f"Latest available reporting period across included series: {reported_period}.",
+        "Stacked components: government, households, and non-financial corporates debt.",
+        "Values are BIS debt to GDP ratios distributed through FRED.",
+    ]
+    return fig, obs, src
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def build_historical_niip_gdp_fig():
+    """Historical NIIP (% of GDP) for major EU economies from Eurostat."""
+    url = "https://ec.europa.eu/eurostat/api/dissemination/sdmx/2.1/data/TIPSII40/?format=SDMX-CSV"
+    src = ["Eurostat SDMX API dataset TIPSII40 (NIIP, % of GDP)"]
+
+    try:
+        r = SESSION.get(url, timeout=90)
+        r.raise_for_status()
+        df = pd.read_csv(StringIO(r.text))
+    except Exception:
+        return None, ["EU historical NIIP data unavailable (Eurostat fetch failed)."], src
+
+    if df.empty:
+        return None, ["EU historical NIIP data unavailable (empty Eurostat response)."], src
+
+    df.columns = [str(c).upper() for c in df.columns]
+    required = {"GEO", "TIME_PERIOD", "OBS_VALUE"}
+    if not required.issubset(set(df.columns)):
+        return None, [f"EU historical NIIP schema mismatch. Columns found: {', '.join(df.columns)}"], src
+
+    target_countries = ["DE", "FR", "IT", "ES", "NL", "BE", "AT", "DK", "PT", "PL"]
+    df_f = df[df["GEO"].isin(target_countries)][["GEO", "TIME_PERIOD", "OBS_VALUE"]].copy()
+    if df_f.empty:
+        return None, ["EU historical NIIP data unavailable after country filtering."], src
+
+    df_f["OBS_VALUE"] = pd.to_numeric(df_f["OBS_VALUE"], errors="coerce")
+    df_f = df_f.dropna(subset=["OBS_VALUE"])
+    if df_f.empty:
+        return None, ["EU historical NIIP data unavailable after value parsing."], src
+
+    df_pivot = df_f.pivot_table(index="TIME_PERIOD", columns="GEO", values="OBS_VALUE", aggfunc="last")
+    if df_pivot.empty:
+        return None, ["EU historical NIIP data unavailable after pivoting."], src
+
+    try:
+        df_pivot.index = pd.PeriodIndex(df_pivot.index.astype(str), freq="Q").to_timestamp("Q")
+    except Exception:
+        df_pivot.index = pd.to_datetime(df_pivot.index, errors="coerce")
+    df_pivot = df_pivot[~df_pivot.index.isna()].sort_index()
+    df_pivot = df_pivot[df_pivot.index >= pd.Timestamp("2010-01-01")]
+    if df_pivot.empty:
+        return None, ["EU historical NIIP data unavailable after date alignment."], src
+
+    data = []
+    for code in target_countries:
+        if code not in df_pivot.columns:
+            continue
+        s = pd.to_numeric(df_pivot[code], errors="coerce").dropna()
+        if s.empty:
+            continue
+        data.append(
+            {
+                "type": "scatter",
+                "mode": "lines",
+                "name": code,
+                "x": s.index,
+                "y": s.values.astype(float),
+                "line": {"width": 1.9},
+                "opacity": 0.9,
+            }
+        )
+
+    if not data:
+        return None, ["EU historical NIIP data unavailable after cleaning."], src
+
+    shapes = []
+    x0 = df_pivot.index.min()
+    x1 = df_pivot.index.max()
+    if x0 is not None and x1 is not None:
+        shapes.append(
+            {"type": "line", "xref": "x", "yref": "y", "x0": x0, "x1": x1, "y0": 0, "y1": 0, "line": {"color": "black", "width": 1}}
+        )
+        shapes.append(
+            {"type": "line", "xref": "x", "yref": "y", "x0": x0, "x1": x1, "y0": -35, "y1": -35, "line": {"color": COLORS["RED"], "width": 2, "dash": "dash"}}
+        )
+
+    layout = {
+        "xaxis": {"title": "", "tickformat": "%Y", "dtick": "M24", "range": [pd.Timestamp("2010-01-01"), df_pivot.index.max()]},
+        "yaxis": {"title": "NIIP (% of GDP)"},
+        "shapes": shapes,
+        "legend": {"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.30},
+        "margin": {"l": 60, "r": 40, "t": 45, "b": 95},
+    }
+    fig = _fig_from_spec(data, layout, height=620)
+
+    obs = [
+        "NIIP above zero indicates a net external creditor position; below zero indicates net debtor position.",
+        "Dashed red line marks the MIP warning threshold (-35% of GDP).",
+        "Countries shown: DE, FR, IT, ES, NL, BE, AT, DK, PT, PL.",
+    ]
+    return fig, obs, src
+
 
 def build_money_market_fig(start_period: str):
     """Repo rates/volumes + ECB corridor + €STR + excess liquidity."""
@@ -1596,14 +1875,16 @@ def get_eu_liquidity_dashboard(
     # Net Liquidity proxy (Millions EUR)
     df["NetLiq_mn"] = df["Assets"] - df["GovDeposits"] - df["DebtCert"] - df["FixedTermDeposits"]
 
-    # 5-day average for liquidity proxy (calendar days)
+    # Rolling averages (calendar days) for both series
     if liq_smooth_days and liq_smooth_days > 1:
         df["NetLiq_5d_mn"] = df["NetLiq_mn"].rolling(liq_smooth_days, min_periods=1).mean()
+        df["CISS_s"] = df["CISS"].rolling(liq_smooth_days, min_periods=1).mean()
     else:
         df["NetLiq_5d_mn"] = df["NetLiq_mn"]
+        df["CISS_s"] = df["CISS"]
 
-    # Keep CISS as-is (daily); ensure no breaks
-    df["CISS_plot"] = df["CISS"].interpolate(method="time").ffill().bfill()
+    # Ensure no line breaks after smoothing
+    df["CISS_plot"] = df["CISS_s"].interpolate(method="time").ffill().bfill()
 
     df = df[df.index >= pd.to_datetime(start)]
     return df, govdep_source
@@ -1667,7 +1948,8 @@ def build_financial_conditions_liquidity_fig(
     last_dt = pd.to_datetime(df.index.max())
     obs = [
         f"CISS: [Composite Indicator of Systemic Stress for EA] - Aggregates stress across Banks, Money, Equity, Bonds and FX Markets. 1 indicates high systemic risk, values below 0.3 generally stable financial conditions.",
-        f"Net liquidity proxy = Assets − GovDeposits − DebtCert − FixedTermDepositsi ({liq_smooth_days}-day average).",
+        f"Net liquidity proxy = Assets - GovDeposits - DebtCert - FixedTermDeposits.",
+        f"Both CISS and net liquidity proxy are shown as {liq_smooth_days}-day rolling averages.",
         f"GovDeposits source chosen: {govdep_source}.",
     ]
 
@@ -1928,6 +2210,8 @@ def load_dashboard_data() -> dict:
 
     # Yield curve + spreads (defaults match EU_Dashboard.py: last 24 months / last 5 years)
     yc_pack, sp_aaa_pack, sp_all_pack = build_yield_curve_figs()
+    cross_debt_pack = build_cross_country_sectoral_debt_latest_fig()
+    niip_pack = build_historical_niip_gdp_fig()
 
     # Money market (same two windows as EU_Dashboard.py)
     mm_start_long = "2020-01-01"
@@ -1965,6 +2249,8 @@ def load_dashboard_data() -> dict:
         "yield_curve": yc_pack,
         "spreads_aaa": sp_aaa_pack,
         "spreads_all": sp_all_pack,
+        "cross_country_sectoral_debt": cross_debt_pack,
+        "historical_niip": niip_pack,
         "money_market_long": (mm_fig_long, mm_obs_long, mm_src_long, mm_start_long),
         "money_market_short": (mm_fig_short, mm_obs_short, mm_src_short, mm_start_short),
         "gold": (gold_top, gold_bot, gold_obs, gold_src),
@@ -2010,7 +2296,7 @@ def main():
     # Navigation (radio as pill tabs)
     page = st.radio(
         "Navigation",
-        ["Monetary Policy", "Inflation", "Yield Curve", "Money Market", "Financial Conditions & Liquidity", "Gold & Liquidity"],
+        ["Monetary Policy", "Inflation", "Yield Curves/Spreads & Macro", "Money Market", "Financial Conditions & Liquidity", "Gold & Liquidity"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -2035,7 +2321,7 @@ def main():
         _show_chart("Core Inflation Index & Moving Averages", fig3, obs3, src3)
 
     # ===== YIELD CURVE =====
-    elif page == "Yield Curve":
+    elif page == "Yield Curves/Spreads & Macro":
         fig, obs, src = data["yield_curve"]
         _show_chart("Euro Area Yield Curve (Monthly Snapshots, last 24 months)", fig, obs, src)
 
@@ -2046,6 +2332,14 @@ def main():
         st.markdown("---")
         fig, obs, src = data["spreads_all"]
         _show_chart("Euro Area 10Y Sovereign Spreads vs Euro Area", fig, obs, src)
+
+        st.markdown("---")
+        fig, obs, src = data["cross_country_sectoral_debt"]
+        _show_chart("Country Sectoral Debt as % of GDP (@ latest avail)", fig, obs, src)
+
+        st.markdown("---")
+        fig, obs, src = data["historical_niip"]
+        _show_chart("NIIP as % of GDP", fig, obs, src)
 
     # ===== MONEY MARKET =====
     elif page == "Money Market":

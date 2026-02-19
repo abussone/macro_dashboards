@@ -26,6 +26,8 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 
+st.set_page_config(page_title="Market Memory Explorer", page_icon="📈", layout="wide")
+
 
 # =============================================================================
 # SESSION STATE INIT (MUST BE BEFORE WIDGETS)
@@ -156,7 +158,9 @@ def _fig_from_spec(data: list[dict], layout: dict, height: int) -> go.Figure:
         tickfont=dict(color="black"),
         title_font=dict(color="black"),
         linecolor="black",
-        gridcolor="rgba(0,0,0,0.05)")
+        gridcolor="rgba(0,0,0,0.05)",
+        hoverformat="%Y-%m-%d",
+    )
     fig.update_yaxes(
         tickfont=dict(color="black"),
         title_font=dict(color="black"),
@@ -547,7 +551,7 @@ def compute_analogs_payload(
 
         analogs_payload.append(
             {
-                "label": f"{dates[i].strftime('%Y-%m')} (ρ={pick.rho:.2f})",
+                "label": f"{dates[i + (L - 1)].strftime('%Y-%m')} (ρ={pick.rho:.2f})",
                 "rho": float(pick.rho),
                 "index100": seg_index100.tolist(),
             }
