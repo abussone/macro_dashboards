@@ -1052,6 +1052,7 @@ def build_cross_country_sectoral_debt_latest_fig():
                 "marker": {"color": colors.get(sector, COLORS["MID_GREY"])},
                 "opacity": 0.9,
                 "width": 0.7,
+                "hovertemplate": "%{x:.1f}%<extra></extra>",
             }
         )
 
@@ -1061,6 +1062,7 @@ def build_cross_country_sectoral_debt_latest_fig():
     reported_period = max(latest_dates).strftime("%Y-%m") if latest_dates else "n/a"
     layout = {
         "title": {"text": f"{reported_period}"},
+        "hovermode": "closest",
         "barmode": "stack",
         "xaxis": {
             "title": "Total Debt (% of GDP)",
